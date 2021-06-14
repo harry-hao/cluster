@@ -7,6 +7,10 @@ public class ConsulCodec {
 
     private ObjectMapper objectMapper;
 
+    public ConsulCodec() {
+        this.objectMapper = new ObjectMapper();
+    }
+
     public ConsulCodec(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }

@@ -7,12 +7,13 @@ import com.ecwid.consul.v1.kv.model.PutParams;
 import com.ecwid.consul.v1.session.model.NewSession;
 import com.ecwid.consul.v1.session.model.Session;
 import com.github.harry_hao.cluster.*;
+import com.github.harry_hao.cluster.util.KSUid;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
-import reactor.core.scheduler.Scheduler;
+import reactor.util.retry.Retry;
 
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
@@ -22,23 +23,13 @@ import java.util.concurrent.ThreadLocalRandom;
 @Slf4j
 public class ConsulCluster implements Cluster {
 
-    private String name;
+    private String myNodeId;
 
     private ConsulClient client;
 
     private ConsulCodec codec;
 
-    private Duration sessionTimeout;
-
-    private Duration sessionRenewPeriod;
-
-    private Duration leaderCheckInterval;
-
-    private Duration leaderCheckFallback;
-
-    private Duration memberRefreshInterval;
-
-    private Scheduler myThread;
+    private ClusterConfig config;
 
     private Sinks.Many<ConsulNode> leaderSink;
 
@@ -50,61 +41,47 @@ public class ConsulCluster implements Cluster {
 
     private Disposable disposable;
 
-    public ConsulCluster(String name, ConsulClient client, ConsulCodec codec,
-                         Duration sessionTimeout, Duration sessionRenewPeriod,
-                         Duration leaderCheckInterval, Duration leaderCheckFallback,
-                         Duration memberRefreshInterval, String myId, Scheduler myThread) {
-        this.name = name;
+    public ConsulCluster(ConsulClient client, ConsulCodec codec, ClusterConfig config) {
+        this.myNodeId = new KSUid().toString();
         this.client = client;
         this.codec = codec;
-        this.sessionTimeout = sessionTimeout;
-        this.sessionRenewPeriod = sessionRenewPeriod;
-        this.leaderCheckInterval = leaderCheckInterval;
-        this.leaderCheckFallback = leaderCheckFallback;
-        this.memberRefreshInterval = memberRefreshInterval;
-        this.myThread = myThread;
+        this.config = config;
         this.leaderSink = Sinks.many().replay().latest();
-        this.leaderFlux = null; // will be set in join
-        this.memberSink = Sinks.many().replay().latest();
-        this.memberFlux = null; // will be set in join
-    }
-
-
-    @Override
-    public void join(String myId, String metadata) {
         this.leaderFlux = this.leaderSink.asFlux()
-                .map(node -> new Node(node.getId(), node.getMetadata(), node.getId().equals(myId)));
-
+                .map(node -> new Node(node.getId(), node.getMetadata(), node.getId().equals(myNodeId)));
+        this.memberSink = Sinks.many().replay().latest();
         this.memberFlux = this.memberSink.asFlux()
                 .map(nodes -> {
                     List<Node> result = new ArrayList<>(nodes.size());
                     for (ConsulNode node : nodes) {
-                        result.add(new Node(node.getId(), node.getMetadata(), node.getId().equals(myId)));
+                        result.add(new Node(node.getId(), node.getMetadata(), node.getId().equals(myNodeId)));
                     }
                     return result;
                 });
+    }
 
+    @Override
+    public void join(String metadata) {
         this.disposable = createSession()
                 .flatMap(session -> {
-                    ConsulNode mySelf = new ConsulNode(myId, metadata);
+                    ConsulNode myNode = new ConsulNode(this.myNodeId, metadata);
 
-                    Mono<Void> sessionLoop = Flux.interval(this.sessionRenewPeriod)
+                    Mono<Void> sessionLoop = Flux.interval(this.config.getSessionTimeout())
                             .flatMap(i -> renewSession(session))
-                            .log()
                             .then();
 
-                    Mono<Void> leaderLoop = Flux.interval(this.leaderCheckInterval)
-                            .concatMap(i -> getOrTakeLeadership(session, mySelf))
+                    Mono<Void> leaderLoop = Flux.interval(this.config.getLeaderCheckInterval())
+                            .concatMap(i -> getOrTakeLeadership(session, myNode))
                             .distinctUntilChanged()
                             .doOnNext(leader -> {
                                 Sinks.EmitResult result = this.leaderSink.tryEmitNext(leader);
-                                if (result.isSuccess()) {
+                                if (!result.isSuccess()) {
                                     log.warn("fail to emit leader | result={}", result);
                                 }
                             })
                             .then();
 
-                    Mono<Void> memberLoop = Flux.interval(this.memberRefreshInterval)
+                    Mono<Void> memberLoop = Flux.interval(this.config.getMemberRefreshInterval())
                             .concatMap(i -> getMembers(session))
                             .distinctUntilChanged()
                             .doOnNext(members -> {
@@ -115,11 +92,11 @@ public class ConsulCluster implements Cluster {
                             })
                             .then();
 
-                    return registerMySelf(session, mySelf)
-                            .log("registerNode")
+                    return registerMySelf(session, myNode)
                             .then(Mono.when(sessionLoop, leaderLoop, memberLoop))
-                            .doOnCancel(() -> destroySession(session).subscribe());
-                }).subscribe();
+                            .doFinally(ignored -> destroySession(session).subscribe());
+                }).retryWhen(Retry.backoff(-1, Duration.ofMillis(100)).maxBackoff(Duration.ofSeconds(10)))
+                .subscribe();
     }
 
     @Override
@@ -127,6 +104,10 @@ public class ConsulCluster implements Cluster {
         if (this.disposable != null) {
             this.disposable.dispose();
         }
+        this.leaderSink = null;
+        this.leaderFlux = null;
+        this.memberSink = null;
+        this.memberFlux = null;
     }
 
     @Override
@@ -139,11 +120,15 @@ public class ConsulCluster implements Cluster {
         return this.leaderFlux;
     }
 
+    protected String myNodeId() {
+        return this.myNodeId;
+    }
+
     private Mono<String> createSession() {
         return Mono.<String>create(sink -> {
-            String name = String.format("%s/%s", this.name, ManagementFactory.getRuntimeMXBean().getName());
+            String name = String.format("%s/%s", this.config.getClusterName(), ManagementFactory.getRuntimeMXBean().getName());
             // todo: investigate to use finer time unit then seconds
-            String ttl = String.format("%ss", this.sessionTimeout.getSeconds());
+            String ttl = String.format("%ss", this.config.getSessionTimeout().getSeconds());
 
             NewSession newSession = new NewSession();
             newSession.setName(name);
@@ -223,9 +208,9 @@ public class ConsulCluster implements Cluster {
         return getCurrentLeader(session)
                 .switchIfEmpty(acquireLeadership(session, mySelf))
                 .repeatWhenEmpty(i -> {
-                    long nanos = ThreadLocalRandom.current().nextLong(this.leaderCheckFallback.toNanos());
-                    return Mono.delay(Duration.ofNanos(nanos));
-            }).checkpoint(String.format("get or take leadership of cluster `%s`", this.name));
+                    long randomFallback = ThreadLocalRandom.current().nextLong(this.config.getLeaderCheckFallback().toNanos());
+                    return Mono.delay(Duration.ofNanos(randomFallback));
+            }).checkpoint(String.format("get or take leadership of cluster `%s`", this.config.getClusterName()));
     }
 
     private Mono<List<ConsulNode>> getMembers(String session) {
@@ -249,7 +234,7 @@ public class ConsulCluster implements Cluster {
 
             log.debug("get members success | session={} members={}", session, members);
             return members;
-        }).checkpoint(String.format("get cluster `%s` members", this.name));
+        }).checkpoint(String.format("get cluster `%s` members", this.config.getClusterName()));
     }
 
     private Mono<ConsulNode> readNode(String id) {
@@ -259,11 +244,11 @@ public class ConsulCluster implements Cluster {
                 return null;
             }
             return this.codec.decode(result.getDecodedValue());
-        }).checkpoint(String.format("read cluster `%s` member `%s`", this.name, id));
+        }).checkpoint(String.format("read cluster `%s` member `%s`", this.config.getClusterName(), id));
     }
 
     private String nodePrefix() {
-        return String.format("%s/node", this.name);
+        return String.format("%s/node", this.config.getClusterName());
     }
 
     private String nodeKey(String id) {
@@ -271,6 +256,6 @@ public class ConsulCluster implements Cluster {
     }
 
     private String leaderKey() {
-        return String.format("%s/leader", this.name);
+        return String.format("%s/leader", this.config.getClusterName());
     }
 }

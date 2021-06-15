@@ -4,14 +4,12 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.github.harry-hao.cluster</groupId>
-    <artifactId>example</artifactId>
-    <version>0.1.0</version>
+    <artifactId>cluster-example</artifactId>
 
     <parent>
         <artifactId>cluster</artifactId>
-        <groupId>com.github.harry-hao</groupId>
-        <version>0.1.0</version>
+        <groupId>io.github.harry-hao</groupId>
+        <version>0.1.0-SNAPSHOT</version>
     </parent>
 
     <packaging>pom</packaging>
@@ -23,6 +21,7 @@
     <properties>
         <feign.version>11.2</feign.version>
         <feign-reactor.version>3.0.0</feign-reactor.version>
+        <spring-boot.version>2.5.1</spring-boot.version>
     </properties>
 
     <dependencyManagement>
@@ -50,7 +49,7 @@
             <dependency>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-dependencies</artifactId>
-                <version>2.5.1</version>
+                <version>${spring-boot.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -63,4 +62,5 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
+
 </project>
